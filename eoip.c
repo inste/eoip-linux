@@ -56,6 +56,41 @@
 
 #include "eoip_version.h"
 
+#define rtnl_dereference(p)	\
+	rcu_dereference_protected(p, lockdep_rtnl_is_held())
+
+static inline u32
+dst_metric_raw(const struct dst_entry *dst, const int metric)
+{
+	return dst->metrics[metric-1];
+}
+
+static inline int ip4_dst_hoplimit(const struct dst_entry *dst)
+{
+	int hoplimit = dst_metric_raw(dst, RTAX_HOPLIMIT);
+
+	if (hoplimit == 0)
+		hoplimit = IPDEFTTL;
+	return hoplimit;
+}
+
+#define __IPTUNNEL_XMIT(stats1, stats2) do {				\
+	int err;												\
+	int pkt_len = skb->len - skb_transport_offset(skb);		\
+															\
+	skb->ip_summed = CHECKSUM_NONE;							\
+	ip_select_ident(iph, &rt->dst, NULL);					\
+															\
+	err = ip_local_out(skb);								\
+	if (likely(net_xmit_eval(err) == 0)) {					\
+		(stats1)->tx_bytes += pkt_len;						\
+		(stats1)->tx_packets++;								\
+	} else {												\
+		(stats2)->tx_errors++;								\
+		(stats2)->tx_aborted_errors++;						\
+	}														\
+} while (0)
+
 static struct rtnl_link_ops eoip_ops __read_mostly;
 static int eoip_tunnel_bind_dev(struct net_device *dev);
 static void eoip_setup(struct net_device *dev);
@@ -94,7 +129,7 @@ static struct net_device_stats *eoip_if_get_stats(struct net_device *dev)
 	int i;
 
 	for_each_possible_cpu(i) {
-		const struct pcpu_tstats *tstats = per_cpu_ptr(dev->tstats, i);
+		const struct pcpu_tstats *tstats = per_cpu_ptr(dev->ml_priv, i);
 
 		sum.rx_packets += tstats->rx_packets;
 		sum.rx_bytes += tstats->rx_bytes;
@@ -404,11 +439,11 @@ static int eoip_rcv(struct sk_buff *skb)
 		skb->protocol = eth_type_trans(skb, tunnel->dev);
 		skb_postpull_rcsum(skb, eth_hdr(skb), ETH_HLEN);
 
-		tstats = this_cpu_ptr(tunnel->dev->tstats);
+		tstats = this_cpu_ptr(tunnel->dev->ml_priv);
 		tstats->rx_packets++;
 		tstats->rx_bytes += skb->len;
 
-		__skb_tunnel_rx(skb, tunnel->dev);
+		skb_tunnel_rx(skb, tunnel->dev);
 
 		skb_reset_network_header(skb);
 
@@ -432,7 +467,7 @@ static netdev_tx_t eoip_if_xmit(struct sk_buff *skb, struct net_device *dev)
 	struct pcpu_tstats *tstats;
 	const struct iphdr *old_iph = ip_hdr(skb);
 	const struct iphdr *tiph;
-	struct flowi4 fl4;
+	struct flowi fl;
 	u8 tos;
 	struct rtable *rt;			/* Route to the other host */
 	struct net_device *tdev;	/* Device to other host */
@@ -453,9 +488,18 @@ static netdev_tx_t eoip_if_xmit(struct sk_buff *skb, struct net_device *dev)
 
 	frame_size = skb->len;
 
-	rt = ip_route_output_gre(dev_net(dev), &fl4, dst, tiph->saddr,
+	fl.oif = tunnel->parms.link;
+	fl.nl_u.ip4_u.daddr = dst;
+	fl.nl_u.ip4_u.saddr = tiph->saddr;
+	fl.nl_u.ip4_u.tos = RT_TOS(tos);
+	fl.proto = IPPROTO_GRE;
+	fl.uli_u.spi = tunnel->parms.o_key;
+
+	ip_route_output_key((dev_net(dev)), &rt, &fl);
+
+/*	rt = ip_route_output_gre(dev_net(dev), &fl4, dst, tiph->saddr,
 			tunnel->parms.o_key, RT_TOS(tos),
-			tunnel->parms.link);
+			tunnel->parms.link); */
 	if (IS_ERR(rt)) {
 		dev->stats.tx_carrier_errors++;
 		goto tx_error;
@@ -522,8 +566,8 @@ static netdev_tx_t eoip_if_xmit(struct sk_buff *skb, struct net_device *dev)
 	iph->frag_off = 0;
 	iph->protocol = IPPROTO_GRE;
 	iph->tos = tos;
-	iph->daddr = fl4.daddr;
-	iph->saddr = fl4.saddr;
+	iph->daddr = fl.nl_u.ip4_u.daddr;
+	iph->saddr = fl.nl_u.ip4_u.daddr;
 	iph->ttl = tiph->ttl;
 
 	if (iph->ttl == 0)
@@ -538,7 +582,7 @@ static netdev_tx_t eoip_if_xmit(struct sk_buff *skb, struct net_device *dev)
 	((__le16 *)(iph + 1))[3] = cpu_to_le16(tunnel->parms.i_key);
 
 	nf_reset(skb);
-	tstats = this_cpu_ptr(dev->tstats);
+	tstats = this_cpu_ptr(dev->ml_priv);
 	__IPTUNNEL_XMIT(tstats, &dev->stats);
 	return NETDEV_TX_OK;
 
@@ -563,14 +607,25 @@ static int eoip_tunnel_bind_dev(struct net_device *dev)
 	/* Guess output device to choose reasonable mtu and needed_headroom */
 
 	if (iph->daddr) {
-		struct flowi4 fl4;
+		struct flowi fl;
 		struct rtable *rt;
 
+
+		fl.oif = tunnel->parms.link;
+		fl.nl_u.ip4_u.daddr = iph->daddr;
+		fl.nl_u.ip4_u.saddr = iph->saddr;
+		fl.nl_u.ip4_u.tos = RT_TOS(iph->tos);
+		fl.proto = IPPROTO_GRE;
+		fl.uli_u.spi = tunnel->parms.o_key;
+
+		ip_route_output_key((dev_net(dev)), &rt, &fl);
+
+/*
 		rt = ip_route_output_gre(dev_net(dev), &fl4,
 				iph->daddr, iph->saddr,
 				tunnel->parms.o_key,
 				RT_TOS(iph->tos),
-				tunnel->parms.link);
+				tunnel->parms.link); */
 		if (!IS_ERR(rt)) {
 			tdev = rt->dst.dev;
 			ip_rt_put(rt);
@@ -609,7 +664,7 @@ static int eoip_if_change_mtu(struct net_device *dev, int new_mtu)
 
 static void eoip_dev_free(struct net_device *dev)
 {
-	free_percpu(dev->tstats);
+	free_percpu(dev->ml_priv);
 	free_netdev(dev);
 }
 
@@ -726,8 +781,8 @@ static int eoip_if_init(struct net_device *dev)
 
 	eoip_tunnel_bind_dev(dev);
 
-	dev->tstats = alloc_percpu(struct pcpu_tstats);
-	if (!dev->tstats)
+	dev->ml_priv = alloc_percpu(struct pcpu_tstats);
+	if (!dev->ml_priv)
 		return -ENOMEM;
 
 	return 0;
@@ -903,12 +958,6 @@ static int __init eoip_init(void)
 	if (err < 0)
 		return err;
 
-	err = gre_add_protocol(&eoip_protocol, GREPROTO_NONSTD_EOIP);
-	if (err < 0) {
-		printk(KERN_INFO "eoip init: can't add protocol\n");
-		goto add_proto_failed;
-	}
-
 	err = rtnl_link_register(&eoip_ops);
 	if (err < 0)
 		goto eoip_ops_failed;
@@ -917,7 +966,6 @@ out:
 	return err;
 
 eoip_ops_failed:
-	gre_del_protocol(&eoip_protocol, GREPROTO_NONSTD_EOIP);
 add_proto_failed:
 	unregister_pernet_device(&eoip_net_ops);
 	goto out;
@@ -926,8 +974,6 @@ add_proto_failed:
 static void __exit eoip_fini(void)
 {
 	rtnl_link_unregister(&eoip_ops);
-	if (gre_del_protocol(&eoip_protocol, GREPROTO_NONSTD_EOIP) < 0)
-		printk(KERN_INFO "eoip close: can't remove protocol\n");
 	unregister_pernet_device(&eoip_net_ops);
 }
 

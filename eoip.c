@@ -54,6 +54,8 @@
 #include <net/ip6_route.h>
 #endif
 
+#include "eoip_version.h"
+
 static struct rtnl_link_ops eoip_ops __read_mostly;
 static int eoip_tunnel_bind_dev(struct net_device *dev);
 static void eoip_setup(struct net_device *dev);
@@ -893,7 +895,9 @@ static int __init eoip_init(void)
 {
 	int err;
 
-	printk(KERN_INFO "EoIP (IPv4) tunneling driver\n");
+	printk(KERN_INFO "EoIP (IPv4) tunneling driver "
+		EOIP_VERSION
+		"\n");
 
 	err = register_pernet_device(&eoip_net_ops);
 	if (err < 0)

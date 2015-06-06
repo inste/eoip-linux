@@ -56,6 +56,8 @@
 
 #include "eoip_version.h"
 
+extern int (*eoip_input)(struct sk_buff *skb);
+
 #define rtnl_dereference(p)	\
 	rcu_dereference_protected(p, lockdep_rtnl_is_held())
 
@@ -155,20 +157,23 @@ static struct ip_tunnel *eoip_tunnel_lookup(struct net_device *dev,
 	struct ip_tunnel *t, *cand = NULL;
 	struct eoip_net *ign = net_generic(net, eoip_net_id);
 	int dev_type = ARPHRD_ETHER;
-	int score, cand_score = 4;
+	int score, cand_score = 8;
 
 	for_each_ip_tunnel_rcu(ign->tunnels[h0]) {
-		if (local != t->parms.iph.saddr ||
-				remote != t->parms.iph.daddr ||
+		/* Relax checks for local source as it can never match when source is autodetected by routing */
+		if (	remote != t->parms.iph.daddr ||
 				key != t->parms.i_key ||
 				!(t->dev->flags & IFF_UP))
 			continue;
 
 		score = 0;
-		if (t->parms.link != link)
+		/* Try to find best matching tunnel */
+		if (local != t->parms.iph.saddr)
 			score |= 1;
-		if (t->dev->type != dev_type)
+		if (t->parms.link != link)
 			score |= 2;
+		if (t->dev->type != dev_type)
+			score |= 4;
 		if (score == 0)
 			return t;
 
@@ -385,7 +390,7 @@ out:
 	rcu_read_unlock();
 }
 
-static int eoip_rcv(struct sk_buff *skb)
+int eoip_rcv(struct sk_buff *skb)
 {
 	const struct iphdr *iph;
 	u8 *h;
@@ -954,6 +959,8 @@ static int __init eoip_init(void)
 	if (err < 0)
 		goto eoip_ops_failed;
 
+	rcu_assign_pointer(eoip_input, eoip_rcv);
+
 out:
 	return err;
 
@@ -965,6 +972,7 @@ add_proto_failed:
 
 static void __exit eoip_fini(void)
 {
+	rcu_assign_pointer(eoip_input, NULL);
 	rtnl_link_unregister(&eoip_ops);
 	unregister_pernet_device(&eoip_net_ops);
 }

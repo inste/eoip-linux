@@ -488,6 +488,8 @@ static netdev_tx_t eoip_if_xmit(struct sk_buff *skb, struct net_device *dev)
 
 	frame_size = skb->len;
 
+	memset(&fl, 0, sizeof(struct flowi));
+
 	fl.oif = tunnel->parms.link;
 	fl.nl_u.ip4_u.daddr = dst;
 	fl.nl_u.ip4_u.saddr = tiph->saddr;
@@ -495,12 +497,7 @@ static netdev_tx_t eoip_if_xmit(struct sk_buff *skb, struct net_device *dev)
 	fl.proto = IPPROTO_GRE;
 	fl.uli_u.spi = tunnel->parms.o_key;
 
-	ip_route_output_key((dev_net(dev)), &rt, &fl);
-
-/*	rt = ip_route_output_gre(dev_net(dev), &fl4, dst, tiph->saddr,
-			tunnel->parms.o_key, RT_TOS(tos),
-			tunnel->parms.link); */
-	if (IS_ERR(rt)) {
+	if (ip_route_output_key((dev_net(dev)), &rt, &fl)) {
 		dev->stats.tx_carrier_errors++;
 		goto tx_error;
 	}
@@ -566,8 +563,8 @@ static netdev_tx_t eoip_if_xmit(struct sk_buff *skb, struct net_device *dev)
 	iph->frag_off = 0;
 	iph->protocol = IPPROTO_GRE;
 	iph->tos = tos;
-	iph->daddr = fl.nl_u.ip4_u.daddr;
-	iph->saddr = fl.nl_u.ip4_u.daddr;
+	iph->daddr = rt->rt_dst;
+	iph->saddr = rt->rt_src;
 	iph->ttl = tiph->ttl;
 
 	if (iph->ttl == 0)
@@ -610,6 +607,7 @@ static int eoip_tunnel_bind_dev(struct net_device *dev)
 		struct flowi fl;
 		struct rtable *rt;
 
+		memset(&fl, 0, sizeof(struct flowi));
 
 		fl.oif = tunnel->parms.link;
 		fl.nl_u.ip4_u.daddr = iph->daddr;
@@ -618,15 +616,7 @@ static int eoip_tunnel_bind_dev(struct net_device *dev)
 		fl.proto = IPPROTO_GRE;
 		fl.uli_u.spi = tunnel->parms.o_key;
 
-		ip_route_output_key((dev_net(dev)), &rt, &fl);
-
-/*
-		rt = ip_route_output_gre(dev_net(dev), &fl4,
-				iph->daddr, iph->saddr,
-				tunnel->parms.o_key,
-				RT_TOS(iph->tos),
-				tunnel->parms.link); */
-		if (!IS_ERR(rt)) {
+		if (!ip_route_output_key((dev_net(dev)), &rt, &fl)) {
 			tdev = rt->dst.dev;
 			ip_rt_put(rt);
 		}
@@ -901,6 +891,8 @@ static size_t eoip_get_size(const struct net_device *dev)
 		nla_total_size(1) +
 		0;
 }
+
+
 
 static int eoip_fill_info(struct sk_buff *skb, const struct net_device *dev)
 {
